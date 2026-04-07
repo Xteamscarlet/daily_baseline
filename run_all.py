@@ -49,7 +49,7 @@ def main():
 
         try:
             # ML 策略（加载刚才训练好的模型）
-            run_backtest(sym, MLStrategy, model_name="mlp", plot=True)
+            run_backtest(sym, MLStrategy, model_name="gbdt", plot=True)
         except Exception:
             logger.exception("MLStrategy backtest failed for %s", sym)
 

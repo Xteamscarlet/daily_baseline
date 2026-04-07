@@ -13,13 +13,12 @@ from config import cfg
 # 1. ML 策略
 # =====================
 class MLStrategy(bt.Strategy):
-    params = (('model_name', 'mlp'),)
+    params = (('model_name', 'gbdt'),)   # 【改】默认用 GBDT
 
     def __init__(self):
         self.order = None
 
     def next(self):
-        # 直接使用预计算的 ml_signal line
         if self.datas[0].ml_signal[0] == 1:
             if not self.position:
                 self.buy()
@@ -89,6 +88,7 @@ def run_backtest(symbol, strategy_class, plot=True, **kwargs):
     cerebro.adddata(data)
     cerebro.addstrategy(strategy_class, **kwargs)
     cerebro.broker.setcash(100000.0)
+    cerebro.broker.setcommission(commission=0.001)  # 【改】加入手续费 0.1%
     results = cerebro.run()
     final_value = cerebro.broker.getvalue()
     print(f"Final Value: {final_value:.2f}")
@@ -100,31 +100,42 @@ def run_backtest(symbol, strategy_class, plot=True, **kwargs):
 
 
 # =====================
-# 5. ML 信号生成（核心修复）
+# 5. ML 信号生成（核心重写）
 # =====================
 def prepare_ml_signal(df: pd.DataFrame,
-                      model_name: str = 'mlp',
-                      proba_threshold_buy: float = 0.38,
-                      proba_threshold_sell: float = 0.38,
+                      model_name: str = 'gbdt',      # 【改】默认 GBDT
+                      proba_threshold_buy: float = None,
+                      proba_threshold_sell: float = None,
                       use_quantile_transform: bool = False,
                       random_state: int = 42) -> pd.DataFrame:
     """
-    3 分类模型信号生成逻辑：
-      - probs[:, 0] = P(弱)   → 用于卖出
-      - probs[:, 1] = P(中)   → 持仓/忽略
-      - probs[:, 2] = P(强)   → 用于买入
+    支持二分类和三分类模型，自动检测并生成信号。
 
-    买入条件：P(强) > proba_threshold_buy
-    卖出条件：P(弱) > proba_threshold_sell
+    二分类模型:
+      - probs[:, 1] = P(涨) > 阈值 → 买入
+      - probs[:, 1] = P(涨) < (1-阈值) → 卖出
+
+    三分类模型:
+      - probs[:, 2] = P(强) > 阈值 → 买入
+      - probs[:, 0] = P(弱) > 阈值 → 卖出
+
+    阈值默认用分位数自适应确定。
     """
     model = joblib.load(cfg.model_dir / f"{model_name}_model.pkl")
     scaler = joblib.load(cfg.model_dir / f"{model_name}_scaler.pkl")
     feats = joblib.load(cfg.model_dir / f"{model_name}_features.pkl")
 
+    # 尝试读取 n_classes，默认 3（兼容旧模型）
+    n_classes_path = cfg.model_dir / f"{model_name}_n_classes.pkl"
+    try:
+        n_classes = joblib.load(n_classes_path)
+    except Exception:
+        n_classes = 3  # 旧模型默认三分类
+
     # 计算特征
     df_feat = compute_features(df)
 
-    # 确保特征列都是数值
+    # 确保特征列是数值
     df_feat = df_feat.copy()
     for c in feats:
         if c not in df_feat.columns:
@@ -133,8 +144,6 @@ def prepare_ml_signal(df: pd.DataFrame,
             df_feat[c] = pd.to_numeric(df_feat[c], errors="coerce")
 
     X = df_feat[feats].values
-
-    # 【修复1】用 np.asarray 转浮点，不用 astype(errors=...)
     X = np.asarray(X, dtype=np.float64)
 
     mask = ~np.isnan(X).any(axis=1)
@@ -145,40 +154,62 @@ def prepare_ml_signal(df: pd.DataFrame,
 
     X_scaled = scaler.transform(X)
 
-    # 【修复2】3 分类模型：用 probs[:, 2]（强）判断买入，probs[:, 0]（弱）判断卖出
+    # 预测概率
     probs = model.predict_proba(X_scaled)
-    n_classes = probs.shape[1]
+    n_model_classes = probs.shape[1]
 
-    if n_classes == 3:
-        p_weak = probs[:, 0]     # P(弱)
-        p_strong = probs[:, 2]   # P(强)
+    # ==================== 信号生成 ====================
 
-        signals = np.zeros(len(probs))
-        signals[p_strong > proba_threshold_buy] = 1    # 强 → 买入
-        signals[p_weak > proba_threshold_sell] = -1     # 弱 → 卖出
+    if n_model_classes == 2:
+        # ---- 二分类 ----
+        p_up = probs[:, 1]   # P(涨)
+
+        # 【改】自适应阈值：用概率分布的 60/40 分位数
+        if proba_threshold_buy is None:
+            proba_threshold_buy = np.quantile(p_up, 0.60)
+        if proba_threshold_sell is None:
+            proba_threshold_sell = 1.0 - np.quantile(p_up, 0.60)
+
+        signals = np.zeros(len(p_up))
+        signals[p_up > proba_threshold_buy] = 1       # 概率高于阈值 → 买入
+        signals[p_up < proba_threshold_sell] = -1     # 概率低于阈值 → 卖出
+
+        print(f"[ML] Binary model: buy_thresh={proba_threshold_buy:.3f}, "
+              f"sell_thresh={proba_threshold_sell:.3f}")
+
     else:
-        # 2 分类兜底
-        p_positive = probs[:, 1]
-        signals = np.zeros(len(probs))
-        signals[p_positive > proba_threshold_buy] = 1
-        signals[p_positive < (1 - proba_threshold_sell)] = -1
+        # ---- 三分类（兼容旧模型）----
+        p_weak = probs[:, 0]
+        p_strong = probs[:, 2]
 
-    # 打印信号分布，方便调参
+        if proba_threshold_buy is None:
+            proba_threshold_buy = np.quantile(p_strong, 0.65)
+        if proba_threshold_sell is None:
+            proba_threshold_sell = np.quantile(p_weak, 0.65)
+
+        signals = np.zeros(len(probs))
+        signals[p_strong > proba_threshold_buy] = 1
+        signals[p_weak > proba_threshold_sell] = -1
+
+        print(f"[ML] 3-class model: buy_thresh={proba_threshold_buy:.3f}, "
+              f"sell_thresh={proba_threshold_sell:.3f}")
+
+    # 打印信号分布
     n_buy = (signals == 1).sum()
     n_sell = (signals == -1).sum()
     n_hold = (signals == 0).sum()
     print(f"[ML] Signal distribution: buy={n_buy}, hold={n_hold}, sell={n_sell} "
           f"(total={len(signals)})")
 
+    # 信号合并回 df
     df_feat['ml_signal'] = signals
 
-    # 信号合并回原始 df
     df_ml = df.copy()
     df_ml['ml_signal'] = np.nan
-    df_ml.iloc[:len(df_feat), df_ml.columns.get_loc('ml_signal')] = df_feat['ml_signal'].values
+    n_assign = min(len(df_feat), len(df_ml))
+    df_ml.iloc[:n_assign, df_ml.columns.get_loc('ml_signal')] = df_feat['ml_signal'].values[:n_assign]
 
-    # 用昨天的信号交易（shift 1），避免未来函数
+    # shift(1) 避免未来函数
     df_ml['ml_signal'] = df_ml['ml_signal'].shift(1)
-
     df_ml = df_ml.dropna(subset=['ml_signal'])
     return df_ml

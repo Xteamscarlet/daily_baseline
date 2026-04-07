@@ -11,7 +11,7 @@ from config import cfg
 
 def train_mlp(flags: dict = None,
               use_quantile_transform: bool = False,
-              n_classes: int = 3,
+              n_classes: int = 2,          # 【改】默认二分类
               random_state: int = 42):
     # 1. 数据准备
     df = prepare_dataset(flags=flags)
@@ -26,10 +26,10 @@ def train_mlp(flags: dict = None,
     ]
     feature_cols = [c for c in df.columns if c not in exclude_cols]
     if not feature_cols:
-        print(f"[MLP] Warning: No features available for flags={flags}. Skipping training.")
+        print(f"[MLP] Warning: No features available for flags={flags}. Skipping.")
         return None, None, 0, []
 
-    # 【修复1】确保所有特征列是数值类型，object 列转 float（无法转换的变 NaN）
+    # 确保所有特征列是数值类型
     df = df.copy()
     for col in feature_cols:
         if pd.api.types.is_object_dtype(df[col]):
@@ -38,22 +38,24 @@ def train_mlp(flags: dict = None,
     X = df[feature_cols].values
     y_raw = df['label'].values
 
-    # 3. 标签构造：3 分类
-    if n_classes == 3:
-        y = np.zeros_like(y_raw, dtype=int)
-        y[y_raw <= 0.33] = 0        # 弱
-        y[(y_raw > 0.33) & (y_raw <= 0.67)] = 1  # 中
-        y[y_raw > 0.67] = 2         # 强
+    # 3. 标签构造
+    if n_classes == 2:
+        # 【改】二分类：label > 0.5 为正（横截面排名前50%），否则为负
+        y = (y_raw > 0.5).astype(int)
+        print(f"[MLP] Binary label: positive={y.sum()}, negative={len(y)-y.sum()}, "
+              f"ratio={y.mean():.3f}")
     else:
-        threshold = cfg.label_threshold_positive if hasattr(cfg, "label_threshold_positive") else 0.7
-        y = (y_raw > threshold).astype(int)
+        y = np.zeros_like(y_raw, dtype=int)
+        y[y_raw <= 0.33] = 0
+        y[(y_raw > 0.33) & (y_raw <= 0.67)] = 1
+        y[y_raw > 0.67] = 2
 
-    # 4. 时间序列切分
+    # 4. 时间序列切分（80/20）
     split_idx = int(len(X) * 0.8)
     X_train, X_test = X[:split_idx], X[split_idx:]
     y_train, y_test = y[:split_idx], y[split_idx:]
 
-    # 【修复2】用 np.asarray 转浮点，不用 astype(errors=...)（numpy 不支持 errors 参数）
+    # 兼容 object dtype
     X_train = np.asarray(X_train, dtype=np.float64)
     X_test = np.asarray(X_test, dtype=np.float64)
 
@@ -74,40 +76,41 @@ def train_mlp(flags: dict = None,
     X_train_s = scaler.fit_transform(X_train)
     X_test_s = scaler.transform(X_test)
 
-    # 6. 训练 MLP
+    # 6. 训练 MLP —— 【改】更大网络 + 更好正则化
     model = MLPClassifier(
-        hidden_layer_sizes=cfg.mlp_hidden_layers,
-        max_iter=cfg.mlp_max_iter,
+        hidden_layer_sizes=cfg.mlp_hidden_layers if hasattr(cfg, 'mlp_hidden_layers') else (256, 128, 64),
+        max_iter=cfg.mlp_max_iter if hasattr(cfg, 'mlp_max_iter') else 500,
+        alpha=0.0001,                  # 【改】L2 正则化（默认0.0001，更强）
+        learning_rate_init=0.001,      # 【改】降低初始学习率，更稳定
         early_stopping=True,
+        validation_fraction=0.1,
+        n_iter_no_change=20,           # 【改】耐心值加大
         random_state=cfg.random_state if hasattr(cfg, "random_state") else 42,
     )
     model.fit(X_train_s, y_train)
 
-    # 7. 评估指标
+    # 7. 评估
     y_pred = model.predict(X_test_s)
     print("\nClassification report (MLP):")
-    print(classification_report(y_test, y_pred))
-
-    if n_classes == 2:
-        try:
-            y_score = model.predict_proba(X_test_s)[:, 1]
-            auc = roc_auc_score(y_test, y_score)
-            print(f"ROC-AUC (binary): {auc:.4f}")
-        except Exception as e:
-            print("ROC-AUC calculation failed:", e)
-    else:
-        try:
-            y_score = model.predict_proba(X_test_s)
-            auc = roc_auc_score(y_test, y_score, multi_class='ovr')
-            print(f"ROC-AUC (multi-class, ovr): {auc:.4f}")
-        except Exception as e:
-            print("ROC-AUC (multi-class) calculation failed:", e)
+    print(classification_report(y_test, y_pred, zero_division=0))
 
     acc = model.score(X_test_s, y_test)
     print(f"Accuracy: {acc:.4f}")
+
+    try:
+        y_score = model.predict_proba(X_test_s)[:, 1] if n_classes == 2 else model.predict_proba(X_test_s)
+        if n_classes == 2:
+            auc = roc_auc_score(y_test, y_score)
+            print(f"ROC-AUC: {auc:.4f}")
+        else:
+            auc = roc_auc_score(y_test, y_score, multi_class='ovr')
+            print(f"ROC-AUC (ovr): {auc:.4f}")
+    except Exception as e:
+        print("AUC failed:", e)
 
     # 8. 保存
     joblib.dump(model, cfg.model_dir / "mlp_model.pkl")
     joblib.dump(scaler, cfg.model_dir / "mlp_scaler.pkl")
     joblib.dump(feature_cols, cfg.model_dir / "mlp_features.pkl")
+    joblib.dump(n_classes, cfg.model_dir / "mlp_n_classes.pkl")  # 【改】保存类别数供回测使用
     return model, scaler, acc, feature_cols
