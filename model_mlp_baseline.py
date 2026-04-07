@@ -1,4 +1,4 @@
-# model_mlp_baseline.py（标签部分改法示例）
+# model_mlp_baseline.py（修复 np.isnan 对 object 列不支持的问题）
 import joblib
 import pandas as pd
 import numpy as np
@@ -7,6 +7,7 @@ from sklearn.preprocessing import StandardScaler, QuantileTransformer
 from sklearn.metrics import classification_report, roc_auc_score
 from feature_engineering import prepare_dataset
 from config import cfg
+
 
 def train_mlp(flags: dict = None,
               use_quantile_transform: bool = False,
@@ -19,13 +20,20 @@ def train_mlp(flags: dict = None,
 
     # 2. 特征选择（保持原有逻辑）
     exclude_cols = [
-        'date', 'symbol', 'label', 'fwd_ret_5', 'amplitude', 'pct_chg', 'change',
+        'date', 'symbol', 'label', 'fwd_ret_5',
+        'amplitude', 'pct_chg', 'change',
         'turnover', 'open', 'high', 'low', 'close', 'volume', 'amount'
     ]
     feature_cols = [c for c in df.columns if c not in exclude_cols]
     if not feature_cols:
         print(f"[MLP] Warning: No features available for flags={flags}. Skipping training.")
         return None, None, 0, []
+
+    # 【修复关键】：先确保 df[feature_cols] 都是数值列，而不是 object/字符串
+    df = df.copy()
+    for col in feature_cols:
+        if pd.api.types.is_object_dtype(df[col]):
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
     X = df[feature_cols].values
     y_raw = df['label'].values  # 当前 label 是 rank 分位数 0~1
@@ -35,9 +43,9 @@ def train_mlp(flags: dict = None,
         # 方案1：按分位数切分（避免 0.7 武断阈值）
         # 如果 label 已经是横截面分位数，可以直接按 0~0.33 / 0.33~0.67 / 0.67~1 划分
         y = np.zeros_like(y_raw, dtype=int)
-        y[y_raw <= 0.33] = 0        # 弱
+        y[y_raw <= 0.33] = 0      # 弱
         y[(y_raw > 0.33) & (y_raw <= 0.67)] = 1  # 中
-        y[y_raw > 0.67] = 2        # 强
+        y[y_raw > 0.67] = 2      # 强
     else:
         # 保留二分类，但阈值可配（比如通过 cfg 或参数传入）
         threshold = cfg.label_threshold_positive if hasattr(cfg, "label_threshold_positive") else 0.7
@@ -47,6 +55,15 @@ def train_mlp(flags: dict = None,
     split_idx = int(len(X) * 0.8)
     X_train, X_test = X[:split_idx], X[split_idx:]
     y_train, y_test = y[:split_idx], y[split_idx:]
+
+    # 【修复关键】：在 np.isnan 之前，确保数组是浮点数，并处理 object 混入的情况
+    # 如果 X_train 仍是 object（理论上经过上面 pd.to_numeric 已经不会），
+    # 这里再兜底：强制转成 float，把无法转换的转成 NaN，再过滤。
+    if not np.issubdtype(X_train.dtype, np.floating):
+        X_train = X_train.astype(float, errors="ignore")
+    if not np.issubdtype(X_test.dtype, np.floating):
+        X_test = X_test.astype(float, errors="ignore")
+
     mask_train = ~np.isnan(X_train).any(axis=1)
     X_train = X_train[mask_train]
     y_train = y_train[mask_train]
@@ -54,13 +71,13 @@ def train_mlp(flags: dict = None,
     mask_test = ~np.isnan(X_test).any(axis=1)
     X_test = X_test[mask_test]
     y_test = y_test[mask_test]
+
     # 5. 标准化（可选 QuantileTransformer）
     if use_quantile_transform:
         scaler = QuantileTransformer(output_distribution='normal',
                                      random_state=random_state)
     else:
         scaler = StandardScaler()
-
     X_train_s = scaler.fit_transform(X_train)
     X_test_s = scaler.transform(X_test)
 
@@ -101,5 +118,4 @@ def train_mlp(flags: dict = None,
     joblib.dump(model, cfg.model_dir / "mlp_model.pkl")
     joblib.dump(scaler, cfg.model_dir / "mlp_scaler.pkl")
     joblib.dump(feature_cols, cfg.model_dir / "mlp_features.pkl")
-
     return model, scaler, acc, feature_cols
