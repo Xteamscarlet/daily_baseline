@@ -10,7 +10,14 @@ class Config:
     # 1. 代理设置
     proxy_host: str = "127.0.0.1"
     proxy_port: str = "7890"  # 不需要请留空 ""
+    # MLP 超参
+    mlp_hidden_layers: tuple = (64, 32)
+    mlp_max_iter: int = 200
 
+    # 标签相关
+    label_threshold_positive: float = 0.7  # 二分类阈值
+    label_n_classes: int = 3               # 多分类类别数
+    label_use_quantile_transform: bool = False
     def __post_init__(self):
         # 只有端口不为空时才设置代理
         if self.proxy_port:
