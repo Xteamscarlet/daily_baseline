@@ -47,7 +47,13 @@ def train_mlp(flags: dict = None,
     split_idx = int(len(X) * 0.8)
     X_train, X_test = X[:split_idx], X[split_idx:]
     y_train, y_test = y[:split_idx], y[split_idx:]
+    mask_train = ~np.isnan(X_train).any(axis=1)
+    X_train = X_train[mask_train]
+    y_train = y_train[mask_train]
 
+    mask_test = ~np.isnan(X_test).any(axis=1)
+    X_test = X_test[mask_test]
+    y_test = y_test[mask_test]
     # 5. 标准化（可选 QuantileTransformer）
     if use_quantile_transform:
         scaler = QuantileTransformer(output_distribution='normal',

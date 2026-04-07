@@ -9,7 +9,7 @@ from typing import List
 class Config:
     # 1. 代理设置
     proxy_host: str = "127.0.0.1"
-    proxy_port: str = "7890"  # 不需要请留空 ""
+    proxy_port: str = "6789"  # 不需要请留空 ""
     # MLP 超参
     mlp_hidden_layers: tuple = (64, 32)
     mlp_max_iter: int = 200
@@ -37,7 +37,8 @@ class Config:
         self.model_dir.mkdir(parents=True, exist_ok=True)
 
     # 3. 股票池
-    symbol_pool: List[str] = field(default_factory=lambda: ["600519", "000858", "601318", "000001", "300750"])
+    symbol_pool: List[str] = field(default_factory=lambda: ['600519','000333','002074','601012','601127','002594','002230','002415','600030','002281','600276','600547','601899','600900',
+    '600875','002241','002384','600760','600598','000786'])
     start_date: str = "20220101"
 
 

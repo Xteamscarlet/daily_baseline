@@ -70,9 +70,16 @@ def run_backtest(symbol, strategy_class, plot=True, **kwargs):
             print(f"[Backtest] No ML signal data for {symbol}, skip.")
             return
 
+    # 确保 date 列是 pd.Timestamp 类型
+    df['date'] = pd.to_datetime(df['date'])
+
+    # 设置 DatetimeIndex
+    df_indexed = df.set_index('date')
+
+    # PandasData 默认用索引做 datetime；这里不要再指定 datetime 列名
     data = PandasData_Extended(
-        dataname=df.set_index('date'),
-        datetime=None,
+        dataname=df_indexed,
+        datetime=None,  # 不写 datetime=...，直接用 DatetimeIndex
         open='open', high='high', low='low', close='close', volume='volume',
         ml_signal='ml_signal' if strategy_class == MLStrategy else None
     )
@@ -105,14 +112,22 @@ def prepare_ml_signal(df: pd.DataFrame,
     feats = joblib.load(cfg.model_dir / f"{model_name}_features.pkl")
 
     # 计算特征 (使用默认 flags)
-    df_feat = compute_features(df)  # 这里可以传入 flags=...（暂保持简单）
-    X = df_feat[feats].values
+    df_feat = compute_features(df)
 
-    # 如果启用 QuantileTransformer，可在此替换 scaler（需要额外保存/加载）
-    X_scaled = scaler.transform(X)
+    # 只保留特征里不含 NaN 的样本（简单粗暴但最稳）
+    X = df_feat[feats].values
+    mask = ~np.isnan(X).any(axis=1)
+    if not mask.all():
+        print(f"[ML] drop {(~mask).sum()} rows due to NaN before scaling")
+    X = X[mask]
+
+    # 顺便对齐 df_feat（后面要生成信号）
+    df_feat = df_feat.loc[mask].reset_index(drop=True)
+
+    X_scaled = scaler.transform(X)  # 现在 X 里没有 NaN
 
     # 生成预测概率
-    probs = model.predict_proba(X_scaled)[:, 1]
+    probs = model.predict_proba(X_scaled)[:, 1]  # 不会再报 NaN
 
     # 生成信号: 概率 > proba_threshold_buy 买入, < proba_threshold_sell 卖出
     signals = np.zeros_like(probs)

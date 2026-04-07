@@ -72,6 +72,6 @@ def compute_features(df: pd.DataFrame, flags: Dict = None) -> pd.DataFrame:
 
     if flags.get('volatility', True):
         df['volatility_20'] = df['close'].pct_change().rolling(20).std()
-
+    df = df.replace([np.inf, -np.inf], np.nan)
     return df
 
