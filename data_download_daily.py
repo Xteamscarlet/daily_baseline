@@ -1,5 +1,7 @@
 # data_download_daily.py
 import os
+import time
+
 import pandas as pd
 import akshare as ak
 from config import cfg
@@ -38,6 +40,7 @@ def load_or_download_daily(symbol: str) -> pd.DataFrame:
     logger.info("[Daily] Downloading %s...", symbol)
     try:
         df = _download_with_retry(symbol)
+        time.sleep(5)
         df.to_parquet(file_path, index=False)
         return df
     except Exception as e:
