@@ -15,7 +15,7 @@ def load_or_download_daily(symbol: str) -> pd.DataFrame:
     try:
         df = ak.stock_zh_a_hist(
             symbol=symbol, period="daily",
-            start_date=cfg.start_date, end_date=cfg.end_date, adjust="qfq"
+            start_date=cfg.start_date, adjust="qfq"
         )
         df = df.rename(columns={
             "日期": "date", "开盘": "open", "收盘": "close",

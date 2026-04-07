@@ -32,7 +32,6 @@ class Config:
     # 3. 股票池
     symbol_pool: List[str] = field(default_factory=lambda: ["600519", "000858", "601318", "000001", "300750"])
     start_date: str = "20220101"
-    end_date: str = "20251231"
 
 
 # 全局单例
