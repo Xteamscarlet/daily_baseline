@@ -1,27 +1,28 @@
 # data_download_daily.py
+import os  # [Fix] 必须在文件最开头
 import pandas as pd
 import akshare as ak
+from config import cfg
 from pathlib import Path
-import config  # 导入配置
 
 
 def load_or_download_daily(symbol: str) -> pd.DataFrame:
     """下载或加载日线数据 (Parquet缓存优先)"""
-    file_path = config.DATA_DIR / f"daily_{symbol}.parquet"
+    file_path = cfg.data_dir / f"daily_{symbol}.parquet"
 
     # 1. 如果存在缓存，直接读取
     if file_path.exists():
-        print(f"[Daily] Loading cache for {symbol}...")
+        # print(f"[Daily] Loading cache for {symbol}...")
         return pd.read_parquet(file_path)
 
     # 2. 否则下载
-    print(f"[Daily] Downloading {symbol} via Akshare (Proxy {'On' if 'HTTP_PROXY' in os.environ else 'Off'})...")
+    print(f"[Daily] Downloading {symbol} via Akshare...")
     try:
         df = ak.stock_zh_a_hist(
             symbol=symbol,
             period="daily",
-            start_date=config.START_DATE,
-            end_date=config.END_DATE,
+            start_date=cfg.start_date,
+            end_date=cfg.end_date,
             adjust="qfq"
         )
         # 重命名列
@@ -40,7 +41,5 @@ def load_or_download_daily(symbol: str) -> pd.DataFrame:
 
 
 if __name__ == "__main__":
-    import os
-
-    for sym in config.SYMBOL_POOL:
+    for sym in cfg.symbol_pool:
         load_or_download_daily(sym)

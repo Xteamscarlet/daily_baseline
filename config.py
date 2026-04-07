@@ -1,29 +1,44 @@
 # config.py
 import os
 from pathlib import Path
+from dataclasses import dataclass, field
+from typing import List
 
-# =====================
-# 1. 代理设置
-# =====================
-# 如果需要代理，请修改端口，不需要则注释掉下面两行
-PROXY_HOST = "127.0.0.1"
-PROXY_PORT = "7890"
 
-# 设置环境变量
-if 'PROXY_PORT' in dir():
-    os.environ["HTTP_PROXY"] = f"http://{PROXY_HOST}:{PROXY_PORT}"
-    os.environ["HTTPS_PROXY"] = f"http://{PROXY_HOST}:{PROXY_PORT}"
+@dataclass
+class Config:
+    # =====================
+    # 1. 代理设置
+    # =====================
+    proxy_host: str = "127.0.0.1"
+    proxy_port: str = "7890"  # 修改为你的端口，不需要则留空
 
-# =====================
-# 2. 项目路径
-# =====================
-PROJECT_ROOT = Path(__file__).parent
-DATA_DIR = PROJECT_ROOT / "data"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+    def __post_init__(self):
+        if self.proxy_port:
+            os.environ["HTTP_PROXY"] = f"http://{self.proxy_host}:{self.proxy_port}"
+            os.environ["HTTPS_PROXY"] = f"http://{self.proxy_host}:{self.proxy_port}"
+            print(f"[Config] Proxy enabled: {self.proxy_host}:{self.proxy_port}")
 
-# =====================
-# 3. 股票池
-# =====================
-SYMBOL_POOL = ["600519", "000858", "601318", "000001", "300750"]
-START_DATE = "20220101"
-END_DATE = "20251231"
+    # =====================
+    # 2. 路径设置
+    # =====================
+    project_root: Path = Path(__file__).parent
+    data_dir: Path = project_root / "data"
+    model_dir: Path = data_dir / "models"
+
+    def ensure_dirs(self):
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.model_dir.mkdir(parents=True, exist_ok=True)
+
+    # =====================
+    # 3. 股票池与时间
+    # =====================
+    # 这里可以直接读取外部文件，为了演示方便写死在代码里
+    symbol_pool: List[str] = field(default_factory=lambda: ["600519", "000858", "601318", "000001", "300750"])
+    start_date: str = "20220101"
+    end_date: str = "20251231"
+
+
+# 全局单例
+cfg = Config()
+cfg.ensure_dirs()
