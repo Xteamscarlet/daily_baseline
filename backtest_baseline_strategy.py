@@ -1,4 +1,4 @@
-# backtest_baseline_strategy.py（修复 prepare_ml_signal 中的 np.isnan 报错）
+# backtest_baseline_strategy.py
 import backtrader as bt
 import pandas as pd
 import numpy as np
@@ -10,13 +10,12 @@ from config import cfg
 
 
 # =====================
-# 1. ML 策略 (新增)
+# 1. ML 策略
 # =====================
 class MLStrategy(bt.Strategy):
-    params = (('model_name', 'mlp'),)  # 'mlp' or 'gbdt'
+    params = (('model_name', 'mlp'),)
 
     def __init__(self):
-        # 这里只读 ml_signal，不再重复加载模型/scaler/特征列
         self.order = None
 
     def next(self):
@@ -50,12 +49,11 @@ class MaCrossStrategy(bt.Strategy):
 
 
 # =====================
-# 3. 扩展 PandasData 以支持自定义列 (关键)
+# 3. 扩展 PandasData
 # =====================
 class PandasData_Extended(bt.feeds.PandasData):
-    # 增加一个 ml_signal 的 line
     lines = ('ml_signal',)
-    params = (('ml_signal', -1),)  # -1 表示列索引，后面会指定列名
+    params = (('ml_signal', -1),)
 
 
 # =====================
@@ -67,23 +65,18 @@ def run_backtest(symbol, strategy_class, plot=True, **kwargs):
     if df.empty:
         return
 
-    # 如果是 ML 策略，需要预计算信号
     if strategy_class == MLStrategy:
-        df = prepare_ml_signal(df, **kwargs)  # 新封装的函数
+        df = prepare_ml_signal(df, **kwargs)
         if df.empty:
             print(f"[Backtest] No ML signal data for {symbol}, skip.")
             return
 
-    # 确保 date 列是 pd.Timestamp 类型
     df['date'] = pd.to_datetime(df['date'])
-
-    # 设置 DatetimeIndex
     df_indexed = df.set_index('date')
 
-    # PandasData 默认用索引做 datetime；这里不要再指定 datetime 列名
     data = PandasData_Extended(
         dataname=df_indexed,
-        datetime=None,  # 不写 datetime=...，直接用 DatetimeIndex
+        datetime=None,
         open='open',
         high='high',
         low='low',
@@ -106,24 +99,32 @@ def run_backtest(symbol, strategy_class, plot=True, **kwargs):
         plt.show()
 
 
+# =====================
+# 5. ML 信号生成（核心修复）
+# =====================
 def prepare_ml_signal(df: pd.DataFrame,
                       model_name: str = 'mlp',
-                      proba_threshold_buy: float = 0.6,
-                      proba_threshold_sell: float = 0.4,
+                      proba_threshold_buy: float = 0.38,
+                      proba_threshold_sell: float = 0.38,
                       use_quantile_transform: bool = False,
                       random_state: int = 42) -> pd.DataFrame:
     """
-    预计算特征 -> 标准化 -> 模型预测 -> 生成 ml_signal -> 返回 df
-    如 use_quantile_transform=True，则使用 QuantileTransformer（可选方案，避免对分布做太强假设）。
+    3 分类模型信号生成逻辑：
+      - probs[:, 0] = P(弱)   → 用于卖出
+      - probs[:, 1] = P(中)   → 持仓/忽略
+      - probs[:, 2] = P(强)   → 用于买入
+
+    买入条件：P(强) > proba_threshold_buy
+    卖出条件：P(弱) > proba_threshold_sell
     """
     model = joblib.load(cfg.model_dir / f"{model_name}_model.pkl")
     scaler = joblib.load(cfg.model_dir / f"{model_name}_scaler.pkl")
     feats = joblib.load(cfg.model_dir / f"{model_name}_features.pkl")
 
-    # 计算特征 (使用默认 flags)
+    # 计算特征
     df_feat = compute_features(df)
 
-    # 【修复关键】：确保 feats 里所有列都是数值，而不是 object/字符串
+    # 确保特征列都是数值
     df_feat = df_feat.copy()
     for c in feats:
         if c not in df_feat.columns:
@@ -131,35 +132,47 @@ def prepare_ml_signal(df: pd.DataFrame,
         if pd.api.types.is_object_dtype(df_feat[c]):
             df_feat[c] = pd.to_numeric(df_feat[c], errors="coerce")
 
-    # 只保留特征里不含 NaN 的样本（简单粗暴但最稳）
     X = df_feat[feats].values
 
-    # 兜底：如果 X 仍是 object，强制转成浮点；无法转换的变成 NaN
-    if not np.issubdtype(X.dtype, np.floating):
-        X = X.astype(float, errors="ignore")
+    # 【修复1】用 np.asarray 转浮点，不用 astype(errors=...)
+    X = np.asarray(X, dtype=np.float64)
 
     mask = ~np.isnan(X).any(axis=1)
     if not mask.all():
         print(f"[ML] drop {(~mask).sum()} rows due to NaN before scaling")
         X = X[mask]
-        # 顺便对齐 df_feat（后面要生成信号）
         df_feat = df_feat.loc[mask].reset_index(drop=True)
 
-    X_scaled = scaler.transform(X)  # 现在 X 里没有 NaN
-    # 生成预测概率
-    probs = model.predict_proba(X_scaled)[:, 1]  # 不会再报 NaN
-    # 生成信号: 概率 > proba_threshold_buy 买入, < proba_threshold_sell 卖出
-    signals = np.zeros_like(probs)
-    signals[probs > proba_threshold_buy] = 1
-    signals[probs < proba_threshold_sell] = -1
+    X_scaled = scaler.transform(X)
 
-    # 【注意】这里用 df_feat 来对齐信号，保证长度正确
+    # 【修复2】3 分类模型：用 probs[:, 2]（强）判断买入，probs[:, 0]（弱）判断卖出
+    probs = model.predict_proba(X_scaled)
+    n_classes = probs.shape[1]
+
+    if n_classes == 3:
+        p_weak = probs[:, 0]     # P(弱)
+        p_strong = probs[:, 2]   # P(强)
+
+        signals = np.zeros(len(probs))
+        signals[p_strong > proba_threshold_buy] = 1    # 强 → 买入
+        signals[p_weak > proba_threshold_sell] = -1     # 弱 → 卖出
+    else:
+        # 2 分类兜底
+        p_positive = probs[:, 1]
+        signals = np.zeros(len(probs))
+        signals[p_positive > proba_threshold_buy] = 1
+        signals[p_positive < (1 - proba_threshold_sell)] = -1
+
+    # 打印信号分布，方便调参
+    n_buy = (signals == 1).sum()
+    n_sell = (signals == -1).sum()
+    n_hold = (signals == 0).sum()
+    print(f"[ML] Signal distribution: buy={n_buy}, hold={n_hold}, sell={n_sell} "
+          f"(total={len(signals)})")
+
     df_feat['ml_signal'] = signals
 
-    # 把信号合并回原始 df（按行索引/顺序合并）
-    # 前面 compute_features 返回的 df_feat 行数可能与 df 不同（有 dropna 等）
-    # 为了简单，这里假设 df_feat 和 df 的前 len(df_feat) 行是对应的
-    # 如果 compute_features 内部改变了行数/顺序，需要按 date/symbol 等键对齐
+    # 信号合并回原始 df
     df_ml = df.copy()
     df_ml['ml_signal'] = np.nan
     df_ml.iloc[:len(df_feat), df_ml.columns.get_loc('ml_signal')] = df_feat['ml_signal'].values
@@ -167,6 +180,5 @@ def prepare_ml_signal(df: pd.DataFrame,
     # 用昨天的信号交易（shift 1），避免未来函数
     df_ml['ml_signal'] = df_ml['ml_signal'].shift(1)
 
-    # 删掉没有信号的样本
     df_ml = df_ml.dropna(subset=['ml_signal'])
     return df_ml

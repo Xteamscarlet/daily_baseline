@@ -1,4 +1,4 @@
-# model_mlp_baseline.py（修复 np.isnan 对 object 列不支持的问题）
+# model_mlp_baseline.py
 import joblib
 import pandas as pd
 import numpy as np
@@ -18,7 +18,7 @@ def train_mlp(flags: dict = None,
     if df.empty:
         return None, None, 0, []
 
-    # 2. 特征选择（保持原有逻辑）
+    # 2. 特征选择
     exclude_cols = [
         'date', 'symbol', 'label', 'fwd_ret_5',
         'amplitude', 'pct_chg', 'change',
@@ -29,25 +29,22 @@ def train_mlp(flags: dict = None,
         print(f"[MLP] Warning: No features available for flags={flags}. Skipping training.")
         return None, None, 0, []
 
-    # 【修复关键】：先确保 df[feature_cols] 都是数值列，而不是 object/字符串
+    # 【修复1】确保所有特征列是数值类型，object 列转 float（无法转换的变 NaN）
     df = df.copy()
     for col in feature_cols:
         if pd.api.types.is_object_dtype(df[col]):
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
     X = df[feature_cols].values
-    y_raw = df['label'].values  # 当前 label 是 rank 分位数 0~1
+    y_raw = df['label'].values
 
     # 3. 标签构造：3 分类
     if n_classes == 3:
-        # 方案1：按分位数切分（避免 0.7 武断阈值）
-        # 如果 label 已经是横截面分位数，可以直接按 0~0.33 / 0.33~0.67 / 0.67~1 划分
         y = np.zeros_like(y_raw, dtype=int)
-        y[y_raw <= 0.33] = 0      # 弱
+        y[y_raw <= 0.33] = 0        # 弱
         y[(y_raw > 0.33) & (y_raw <= 0.67)] = 1  # 中
-        y[y_raw > 0.67] = 2      # 强
+        y[y_raw > 0.67] = 2         # 强
     else:
-        # 保留二分类，但阈值可配（比如通过 cfg 或参数传入）
         threshold = cfg.label_threshold_positive if hasattr(cfg, "label_threshold_positive") else 0.7
         y = (y_raw > threshold).astype(int)
 
@@ -56,13 +53,9 @@ def train_mlp(flags: dict = None,
     X_train, X_test = X[:split_idx], X[split_idx:]
     y_train, y_test = y[:split_idx], y[split_idx:]
 
-    # 【修复关键】：在 np.isnan 之前，确保数组是浮点数，并处理 object 混入的情况
-    # 如果 X_train 仍是 object（理论上经过上面 pd.to_numeric 已经不会），
-    # 这里再兜底：强制转成 float，把无法转换的转成 NaN，再过滤。
-    if not np.issubdtype(X_train.dtype, np.floating):
-        X_train = X_train.astype(float, errors="ignore")
-    if not np.issubdtype(X_test.dtype, np.floating):
-        X_test = X_test.astype(float, errors="ignore")
+    # 【修复2】用 np.asarray 转浮点，不用 astype(errors=...)（numpy 不支持 errors 参数）
+    X_train = np.asarray(X_train, dtype=np.float64)
+    X_test = np.asarray(X_test, dtype=np.float64)
 
     mask_train = ~np.isnan(X_train).any(axis=1)
     X_train = X_train[mask_train]
@@ -72,7 +65,7 @@ def train_mlp(flags: dict = None,
     X_test = X_test[mask_test]
     y_test = y_test[mask_test]
 
-    # 5. 标准化（可选 QuantileTransformer）
+    # 5. 标准化
     if use_quantile_transform:
         scaler = QuantileTransformer(output_distribution='normal',
                                      random_state=random_state)
@@ -81,7 +74,7 @@ def train_mlp(flags: dict = None,
     X_train_s = scaler.fit_transform(X_train)
     X_test_s = scaler.transform(X_test)
 
-    # 6. 训练 MLP（超参建议从 cfg 读取，见下一节）
+    # 6. 训练 MLP
     model = MLPClassifier(
         hidden_layer_sizes=cfg.mlp_hidden_layers,
         max_iter=cfg.mlp_max_iter,
@@ -90,7 +83,7 @@ def train_mlp(flags: dict = None,
     )
     model.fit(X_train_s, y_train)
 
-    # 7. 指标：多分类 / 二分类通用
+    # 7. 评估指标
     y_pred = model.predict(X_test_s)
     print("\nClassification report (MLP):")
     print(classification_report(y_test, y_pred))
@@ -103,7 +96,6 @@ def train_mlp(flags: dict = None,
         except Exception as e:
             print("ROC-AUC calculation failed:", e)
     else:
-        # 多分类 AUC（one-vs-rest）
         try:
             y_score = model.predict_proba(X_test_s)
             auc = roc_auc_score(y_test, y_score, multi_class='ovr')
